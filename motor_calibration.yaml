@@ -1,7 +1,8 @@
 motors:
-  "0x00A":
-    name: "test_motor_10"
-    raw_zero_p_uint: "0x855B"
-    raw_zero_pos_rad: 0.523194
+  '0x00A':
+    name: motor_00A
+    raw_zero_p_uint: '0x9355'
+    raw_zero_pos_rad: 1.8881132219424739
     zero_command_persistent: false
-    notes: "Set-zero works during active session but was not retained after power cycle in this test; software offset required."
+    direction_sign: 1
+    notes: Software zero captured by calibration_helper_app.py

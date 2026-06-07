@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from pathlib import Path
 from typing import Any
 
 import can
+import yaml
 
 from calibration import apply_software_offset, load_motor_calibration
 from mit_packet import analyze_feedback_candidate, pack_mit_command
@@ -13,6 +15,8 @@ from mit_packet import analyze_feedback_candidate, pack_mit_command
 
 DEFAULT_CHANNEL = "can0"
 DEFAULT_INTERFACE = "socketcan"
+DEFAULT_CALIBRATION_PATH = "motor_calibration.yaml"
+DEFAULT_CAPTURE_NOTES = "Software zero captured by calibration_helper_app.py"
 DETECT_START_ID = 0x001
 DETECT_END_ID = 0x00A
 CANDIDATE_DEADLINE_SEC = 0.03
@@ -151,6 +155,36 @@ def read_raw_position_once(channel: str, interface: str, motor_id: int) -> float
             bus.shutdown()
 
 
+def capture_raw_zero_once(channel: str, interface: str, motor_id: int) -> dict[str, float | int] | None:
+    packet = build_zero_torque_packet()
+    if packet is None:
+        return None
+
+    bus = None
+    try:
+        bus = can.Bus(interface=interface, channel=channel)
+        msg = can.Message(arbitration_id=motor_id, data=packet, is_extended_id=False)
+        bus.send(msg)
+
+        raw_bytes = receive_feedback_once(bus, motor_id, packet)
+        if raw_bytes is None:
+            print("No feedback received")
+            return None
+
+        candidate = analyze_feedback_candidate(raw_bytes)
+        if candidate is None:
+            print("No feedback received")
+            return None
+
+        return {
+            "raw_zero_p_uint": int(candidate["p_uint"]),
+            "raw_zero_pos_rad": float(candidate["candidate_position_rad"]),
+        }
+    finally:
+        if bus is not None:
+            bus.shutdown()
+
+
 def motor_calibration_key(motor_id: int) -> str:
     return format_motor_id(motor_id)
 
@@ -215,6 +249,97 @@ def print_calibration_entry(entry: dict[str, Any]) -> None:
             print(f"{key}: {value}")
 
 
+def load_calibration_file(path: str = DEFAULT_CALIBRATION_PATH) -> dict[str, Any]:
+    calibration_path = Path(path)
+    if not calibration_path.exists():
+        return {"motors": {}}
+
+    with calibration_path.open("r", encoding="utf-8") as f:
+        calibration = yaml.safe_load(f)
+
+    if calibration is None:
+        return {"motors": {}}
+    if not isinstance(calibration, dict):
+        raise ValueError(f"Invalid calibration YAML root: {path}")
+
+    motors = calibration.setdefault("motors", {})
+    if not isinstance(motors, dict):
+        raise ValueError(f"Invalid calibration YAML motors section: {path}")
+
+    return calibration
+
+
+def write_calibration_file(path: str, calibration: dict[str, Any]) -> None:
+    calibration_path = Path(path)
+    with calibration_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(calibration, f, allow_unicode=True, sort_keys=False)
+
+
+def build_calibration_entry(name: str, raw_p_uint: int, raw_pos_rad: float, notes: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "raw_zero_p_uint": f"0x{raw_p_uint:04X}",
+        "raw_zero_pos_rad": float(raw_pos_rad),
+        "zero_command_persistent": False,
+        "direction_sign": 1,
+        "notes": notes,
+    }
+
+
+def default_motor_name(motor_id: int) -> str:
+    return f"motor_{motor_id:03X}"
+
+
+def capture_current_position_as_zero(channel: str, interface: str, selected_motor_id: int | None) -> None:
+    if selected_motor_id is None:
+        print("Error: No motor selected. Please run auto-detection first.")
+        return
+
+    captured = capture_raw_zero_once(channel, interface, selected_motor_id)
+    if captured is None:
+        return
+
+    raw_p_uint = int(captured["raw_zero_p_uint"])
+    raw_pos_rad = float(captured["raw_zero_pos_rad"])
+    motor_key = format_motor_id(selected_motor_id)
+
+    print("[Captured Raw Position]")
+    print(f"motor_id: {motor_key}")
+    print(f"raw_zero_p_uint: 0x{raw_p_uint:04X}")
+    print(f"raw_zero_pos_rad: {raw_pos_rad:.6f}")
+
+    try:
+        calibration = load_calibration_file(DEFAULT_CALIBRATION_PATH)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        print(f"Failed to load {DEFAULT_CALIBRATION_PATH}: {exc}")
+        return
+
+    motors = calibration["motors"]
+    if motor_key in motors:
+        print(f"WARNING: existing calibration for {motor_key} will be updated if you type SAVE.")
+
+    print("This will update motor_calibration.yaml.")
+    confirmation = input("Type SAVE to write this as software zero: ")
+    if confirmation != "SAVE":
+        print("Aborted. motor_calibration.yaml was not modified.")
+        return
+
+    motors[motor_key] = build_calibration_entry(
+        name=default_motor_name(selected_motor_id),
+        raw_p_uint=raw_p_uint,
+        raw_pos_rad=raw_pos_rad,
+        notes=DEFAULT_CAPTURE_NOTES,
+    )
+
+    try:
+        write_calibration_file(DEFAULT_CALIBRATION_PATH, calibration)
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"Failed to write {DEFAULT_CALIBRATION_PATH}: {exc}")
+        return
+
+    print(f"Saved software zero for {motor_key} to {DEFAULT_CALIBRATION_PATH}")
+
+
 def show_saved_calibration(selected_motor_id: int | None) -> None:
     try:
         calibration = load_motor_calibration()
@@ -261,7 +386,8 @@ def print_menu(selected_motor_id: int | None) -> None:
     print("[1] Auto-detect connected motor ID")
     print("[2] Read current joint angle")
     print("[3] Show saved calibration")
-    print("[4] Exit")
+    print("[4] Capture current position as software zero")
+    print("[5] Exit")
     print("-----------------------------------------")
 
 
@@ -271,7 +397,7 @@ def run_app(channel: str, interface: str) -> int:
 
     while running:
         print_menu(selected_motor_id)
-        selection = input("Select menu [1-4]: ").strip()
+        selection = input("Select menu [1-5]: ").strip()
 
         if selection == "1":
             detected_id = auto_detect_motor_id(channel, interface)
@@ -291,6 +417,8 @@ def run_app(channel: str, interface: str) -> int:
         elif selection == "3":
             show_saved_calibration(selected_motor_id)
         elif selection == "4":
+            capture_current_position_as_zero(channel, interface, selected_motor_id)
+        elif selection == "5":
             running = False
         else:
             print("Invalid selection.")
