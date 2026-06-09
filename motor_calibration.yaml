@@ -6,3 +6,17 @@ motors:
     zero_command_persistent: false
     direction_sign: 1
     notes: Software zero captured by calibration_helper_app.py
+  '0x007':
+    name: motor_007
+    raw_zero_p_uint: '0x89A4'
+    raw_zero_pos_rad: 0.9416723887998781
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by calibration_helper_app.py
+  '0x005':
+    name: motor_005
+    raw_zero_p_uint: '0x82EC'
+    raw_zero_pos_rad: 0.28553444724193255
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by calibration_helper_app.py
