@@ -194,10 +194,10 @@ def run_once(channel: str, motor_ids: list[int]) -> int:
 
     if all(results):
         print("Overall result: all requested motors read successfully")
+        return 0
     else:
         print("Overall result: one or more motors were not read successfully")
-
-    return 0
+        return 2
 
 
 def main() -> None:
