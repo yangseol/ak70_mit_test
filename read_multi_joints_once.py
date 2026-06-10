@@ -1,3 +1,5 @@
+"""여러 AK70 모터를 zero-torque read로 한 번씩 읽고 joint state를 출력하는 helper."""
+
 from __future__ import annotations
 
 import argparse

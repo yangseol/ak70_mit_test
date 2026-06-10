@@ -1,3 +1,5 @@
+"""AK70 모터 ID 범위를 한 번 스캔하고 calibration 여부를 출력하는 감지 helper."""
+
 from __future__ import annotations
 
 import argparse

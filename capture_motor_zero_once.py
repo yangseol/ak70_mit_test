@@ -1,3 +1,5 @@
+"""단일 AK70 모터의 현재 raw position을 software zero로 저장하는 helper."""
+
 from __future__ import annotations
 
 import argparse

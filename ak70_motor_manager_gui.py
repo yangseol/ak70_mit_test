@@ -1,3 +1,5 @@
+"""AK70 모터 감지, 캘리브레이션, 원점 이동 helper를 실행하는 Tkinter GUI."""
+
 from __future__ import annotations
 
 import datetime as dt

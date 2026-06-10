@@ -1,3 +1,5 @@
+"""AK70 모터를 움직이지 않고 software zero 기준 원점 이동 계획만 판정하는 helper."""
+
 from __future__ import annotations
 
 import argparse

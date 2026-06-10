@@ -1,3 +1,5 @@
+"""READY 판정된 AK70 모터만 순차적으로 제한 nudge하는 원점 이동 helper."""
+
 from __future__ import annotations
 
 import argparse
