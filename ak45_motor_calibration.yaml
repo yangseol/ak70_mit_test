@@ -1,0 +1,17 @@
+motors:
+  '0x006':
+    name: right_ankle_roll
+    model: AK45-36-KV80
+    raw_zero_pos_rad: 0.25959411001754873
+    direction_sign: 1
+    captured_at: '2026-06-25T08:14:57+00:00'
+    power_cycle_verified: true
+    notes: ''
+  '0x00C':
+    name: left_ankle_roll
+    model: AK45-36-KV80
+    raw_zero_pos_rad: 0.24242771038376354
+    direction_sign: 1
+    captured_at: '2026-06-25T09:28:04+00:00'
+    power_cycle_verified: false
+    notes: ''

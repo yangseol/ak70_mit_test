@@ -1,6 +1,12 @@
 __pycache__/
+*.py[cod]
 *.pyc
 .pytest_cache/
 .env
 *.log
 .venv/
+.ak_realtime_controller.sock
+.ak_realtime_controller.lock
+.ak_realtime_client_*.sock
+.ak_realtime_probe_*.sock
+all_motor_can_check.log

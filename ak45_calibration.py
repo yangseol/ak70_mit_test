@@ -15,20 +15,11 @@ from motor_profiles import format_motor_id, get_motor_profile, normalize_motor_i
 
 
 DEFAULT_AK45_CALIBRATION_PATH = Path(__file__).resolve().parent / "ak45_motor_calibration.yaml"
-AK45_IDS = (0x00B, 0x00C, 0x00D)
+AK45_IDS = (0x006, 0x00C)
 
 DEFAULT_AK45_CALIBRATION: dict[str, Any] = {
     "motors": {
-        "0x00B": {
-            "name": "left_ankle_roll",
-            "model": "AK45-36-KV80",
-            "raw_zero_pos_rad": None,
-            "direction_sign": 1,
-            "captured_at": None,
-            "power_cycle_verified": False,
-            "notes": "",
-        },
-        "0x00C": {
+        "0x006": {
             "name": "right_ankle_roll",
             "model": "AK45-36-KV80",
             "raw_zero_pos_rad": None,
@@ -37,8 +28,8 @@ DEFAULT_AK45_CALIBRATION: dict[str, Any] = {
             "power_cycle_verified": False,
             "notes": "",
         },
-        "0x00D": {
-            "name": "spare_ak45",
+        "0x00C": {
+            "name": "left_ankle_roll",
             "model": "AK45-36-KV80",
             "raw_zero_pos_rad": None,
             "direction_sign": 1,
@@ -206,4 +197,3 @@ def joint_position_from_calibration(motor_id: int | str, raw_pos_rad: float, cal
     if entry.get("raw_zero_pos_rad") is None:
         raise ValueError(f"AK45 calibration missing for {format_motor_id(motor_id)}")
     return raw_to_joint_position(raw_pos_rad, float(entry["raw_zero_pos_rad"]), int(entry["direction_sign"]))
-

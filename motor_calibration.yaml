@@ -1,22 +1,77 @@
 motors:
   '0x00A':
     name: motor_00A
-    raw_zero_p_uint: '0x9355'
-    raw_zero_pos_rad: 1.8881132219424739
+    raw_zero_p_uint: '0x871D'
+    raw_zero_pos_rad: 0.6948577096208126
     zero_command_persistent: false
-    direction_sign: 1
+    direction_sign: -1
     notes: Software zero captured by calibration_helper_app.py
   '0x007':
     name: motor_007
-    raw_zero_p_uint: '0x89A4'
-    raw_zero_pos_rad: 0.9416723887998781
+    raw_zero_p_uint: '0x83D8'
+    raw_zero_pos_rad: 0.3755626764324411
     zero_command_persistent: false
     direction_sign: 1
     notes: Software zero captured by calibration_helper_app.py
   '0x005':
     name: motor_005
-    raw_zero_p_uint: '0x82EC'
-    raw_zero_pos_rad: 0.28553444724193255
+    raw_zero_p_uint: '0x88C4'
+    raw_zero_pos_rad: 0.8562218661783785
     zero_command_persistent: false
     direction_sign: 1
-    notes: Software zero captured by calibration_helper_app.py
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x008':
+    name: motor_008
+    raw_zero_p_uint: '0x848B'
+    raw_zero_pos_rad: 0.44384679942015737
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x004':
+    name: motor_004
+    raw_zero_p_uint: '0x853C'
+    raw_zero_pos_rad: 0.5113679713130388
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x003':
+    name: motor_003
+    raw_zero_p_uint: '0x7E3F'
+    raw_zero_pos_rad: -0.17109178301670802
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x001':
+    name: motor_001
+    raw_zero_p_uint: '0x861E'
+    raw_zero_pos_rad: 0.5975814450293733
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x006':
+    name: motor_006
+    raw_zero_p_uint: '0x85A6'
+    raw_zero_pos_rad: 0.5518043793392842
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x009':
+    name: motor_009
+    raw_zero_p_uint: '0x8161'
+    raw_zero_pos_rad: 0.13485160601205415
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x002':
+    name: motor_002
+    raw_zero_p_uint: '0x82EF'
+    raw_zero_pos_rad: 0.2866788738841848
+    zero_command_persistent: false
+    direction_sign: 1
+    notes: Software zero captured by ak70_motor_manager_gui.py
+  '0x00B':
+    name: left_ankle_pitch
+    raw_zero_pos_rad: 0.3038452735179682
+    direction_sign: 1
+    raw_zero_p_uint: '0x831C'
+    zero_command_persistent: false

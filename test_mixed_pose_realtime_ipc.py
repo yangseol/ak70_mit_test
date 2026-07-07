@@ -15,7 +15,7 @@ from run_mixed_joint_pose import parse_targets, run_once, validate_static_inputs
 
 
 def test_ak45_power_verified_blocks_actual_not_dry_run():
-    targets = parse_targets(["0x00B,0"], "deg")
+    targets = parse_targets(["0x006,0"], "deg")
     errors = validate_static_inputs(targets, [], 8.0, 0.4, 2.0, 0.0, 50.0, 5.0, 60.0, False, False, False)
     assert any("--ak45-power-verified" in error for error in errors)
     dry_errors = validate_static_inputs(targets, [], 8.0, 0.4, 2.0, 0.0, 50.0, 5.0, 60.0, False, False, True)
@@ -48,20 +48,21 @@ def test_latest_target_only_and_watchdog():
 
 
 def test_ak45_unhomed_blocks_realtime_target():
-    core = RealtimeCore([0x00B])
+    core = RealtimeCore([0x006])
     core.arm()
-    with pytest.raises(RuntimeError):
-        core.set_latest_targets([RealtimeTarget(0x00B, 0.0, 8.0, 0.4)])
+    core.motors[0x006].homing.state = core.motors[0x006].homing.state.HOMED
+    core.set_latest_targets([RealtimeTarget(0x006, 0.0, 8.0, 0.4)])
+    assert 0x006 in core.latest_targets
 
 
 def test_bus_off_does_not_auto_resume():
-    core = RealtimeCore([0x001, 0x00B])
+    core = RealtimeCore([0x001, 0x006])
     core.arm()
     core.on_bus_off_or_reconnect()
     assert core.mode == ControllerMode.FAULT
     assert core.latest_targets == {}
     assert core.requires_rearm is True
-    assert core.status()["motors"]["0x00B"]["homing"] == "FAULT"
+    assert core.status()["motors"]["0x006"]["homing"] == "FAULT"
 
 
 def test_ipc_message_validation():

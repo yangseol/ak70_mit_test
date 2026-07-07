@@ -17,8 +17,11 @@ from motor_profiles import (
 def test_motor_profile_id_selection():
     assert get_motor_profile("0x001").model == "AK70-10"
     assert get_motor_profile("0x00A").model == "AK70-10"
-    assert get_motor_profile("0x00B").model == "AK45-36-KV80"
-    assert get_motor_profile("0x00D").model == "AK45-36-KV80"
+    assert get_motor_profile("0x006").model == "AK45-36-KV80"
+    assert get_motor_profile("0x00B").model == "AK70-10"
+    assert get_motor_profile("0x00C").model == "AK45-36-KV80"
+    with pytest.raises(ValueError):
+        get_motor_profile("0x00D")
     with pytest.raises(ValueError):
         get_motor_profile("0x00E")
 
@@ -45,7 +48,7 @@ def test_ak45_pack_unpack_round_trip_uses_ak45_ranges():
     t_int = float_to_uint(5.0, profile.protocol_torque_min, profile.protocol_torque_max, 12)
     feedback_like = bytes(
         [
-            0x0B,
+                0x06,
             p_int >> 8,
             p_int & 0xFF,
             v_int >> 4,
@@ -55,8 +58,8 @@ def test_ak45_pack_unpack_round_trip_uses_ak45_ranges():
             0,
         ]
     )
-    decoded = unpack_mit_feedback("0x00B", feedback_like)
-    assert decoded.motor_id == 0x00B
+    decoded = unpack_mit_feedback("0x006", feedback_like)
+    assert decoded.motor_id == 0x006
     assert decoded.position == pytest.approx(1.25, abs=0.001)
     assert decoded.velocity == pytest.approx(-3.0, abs=0.002)
     assert decoded.torque == pytest.approx(5.0, abs=0.02)
@@ -64,11 +67,11 @@ def test_ak45_pack_unpack_round_trip_uses_ak45_ranges():
 
 def test_strict_range_and_finite_checks():
     with pytest.raises(ValueError):
-        pack_mit_command("0x00B", 0.0, 45.0, 0.0, 0.0, 0.0)
+        pack_mit_command("0x006", 0.0, 45.0, 0.0, 0.0, 0.0)
     with pytest.raises(ValueError):
-        pack_mit_command("0x00B", math.nan, 0.0, 0.0, 0.0, 0.0)
+        pack_mit_command("0x006", math.nan, 0.0, 0.0, 0.0, 0.0)
     with pytest.raises(ValueError):
-        pack_checked_commands([MitCommand(0x00B, 0.0, 0.0, 0.0, 0.0), MitCommand(0x00B, 0.0, 0.0, 0.0, 0.0)])
+        pack_checked_commands([MitCommand(0x006, 0.0, 0.0, 0.0, 0.0), MitCommand(0x006, 0.0, 0.0, 0.0, 0.0)])
 
 
 def test_encoder_output_periods():

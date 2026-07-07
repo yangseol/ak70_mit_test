@@ -9,14 +9,24 @@ from __future__ import annotations
 import math
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from ak45_calibration import load_ak45_calibration
 from calibration import load_motor_calibration
 from homing_state import HomingMachine, HomingState
-from motor_profiles import format_motor_id, get_motor_profile, is_ak45, normalize_motor_id
+from motor_profiles import (
+    AK70_KD_MAX,
+    AK70_KD_MIN,
+    AK70_KP_MAX,
+    AK70_KP_MIN,
+    format_motor_id,
+    get_motor_profile,
+    is_ak45,
+    normalize_motor_id,
+)
 
 
 DEFAULT_RATE_HZ = 50.0
@@ -27,12 +37,14 @@ GUI_HEARTBEAT_INTERVAL_MS = 250
 GUI_HEARTBEAT_MAX_AGE_SEC = 0.75
 GUI_LEASE_TIMEOUT_SEC = 1.0
 AK70_TARGET_LIMIT_DEG = 120.0
-AK70_KP_MAX = 10.0
-AK70_KD_MAX = 2.0
+AK70_TORQUE_FF_MIN_NM = -25.0
+AK70_TORQUE_FF_MAX_NM = 25.0
 FEEDBACK_TIMEOUT_SEC = 0.5
 MAX_CONSECUTIVE_FEEDBACK_MISSES = 10
 FOLLOWING_ERROR_CONSECUTIVE_LIMIT = 3
 FOLLOWING_ERROR_GRACE_SEC = 0.2
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_CALIBRATION_PATH = BASE_DIR / "motor_calibration.yaml"
 
 
 class ControllerMode(Enum):
@@ -92,6 +104,7 @@ class RealtimeTarget:
     session_token: str | None = None
     session_epoch: int | None = None
     plan_id: str | None = None
+    torque_ff_nm: float = 0.0
 
 
 @dataclass
@@ -109,6 +122,7 @@ class TrajectoryPlan:
     waypoints: dict[int, list[TrajectoryWaypoint]]
     kp: dict[int, float]
     kd: dict[int, float]
+    torque_ff_nm: dict[int, float]
     max_following_error_deg: dict[int, float]
     current_waypoint_index: int
     segment_start_position_rad: dict[int, float]
@@ -142,6 +156,7 @@ class MotorRuntime:
     target_deg: float | None = None
     kp: float | None = None
     kd: float | None = None
+    torque_ff_nm: float = 0.0
     owner_session_token: str | None = None
     following_error_deg: float | None = None
     following_error_exceed_count: int = 0
@@ -185,6 +200,17 @@ def _target_limit_for(motor_id: int) -> float:
     return AK70_TARGET_LIMIT_DEG
 
 
+def validate_ak70_torque_ff_nm(value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("AK70 torque_ff_nm must be finite")
+    if not AK70_TORQUE_FF_MIN_NM <= value <= AK70_TORQUE_FF_MAX_NM:
+        raise ValueError(
+            f"AK70 torque_ff_nm must be {AK70_TORQUE_FF_MIN_NM:g}..{AK70_TORQUE_FF_MAX_NM:g} Nm"
+        )
+    return value
+
+
 def _ak70_calibration_entry(calibration: dict[str, Any], motor_id: int) -> dict[str, Any]:
     key = format_motor_id(motor_id)
     motors = calibration.get("motors", {})
@@ -196,16 +222,40 @@ def _ak70_calibration_entry(calibration: dict[str, Any], motor_id: int) -> dict[
     return entry
 
 
-def joint_deg_to_raw_rad(motor_id: int, target_deg: float, calibration: dict[str, Any] | None) -> float:
-    """Convert GUI joint target to protocol raw position for AK70 software zero."""
+def _entry_for_motor(
+    motor_id: int,
+    calibration: dict[str, Any] | None,
+    ak45_calibration: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the configured software-zero entry without changing either file.
+
+    Older installations stored ID 6 in the AK70 file and ID 11 in the AK45
+    file.  Those entries remain usable as an in-memory compatibility fallback
+    after the fixed 6/12 AK45 wiring map is applied.
+    """
+
+    key = format_motor_id(motor_id)
+    primary = ak45_calibration if is_ak45(motor_id) else calibration
+    secondary = calibration if is_ak45(motor_id) else ak45_calibration
+    for data in (primary, secondary):
+        motors = data.get("motors", {}) if isinstance(data, dict) else {}
+        entry = motors.get(key)
+        if isinstance(entry, dict) and entry.get("raw_zero_pos_rad") is not None:
+            return entry
+    raise ValueError(f"{key} calibration is missing")
+
+
+def joint_deg_to_raw_rad(
+    motor_id: int,
+    target_deg: float,
+    calibration: dict[str, Any] | None,
+    ak45_calibration: dict[str, Any] | None = None,
+) -> float:
+    """Convert a joint degree target to the model-specific protocol position."""
 
     motor_id = normalize_motor_id(motor_id)
     joint_rad = math.radians(target_deg)
-    if is_ak45(motor_id):
-        return joint_rad
-    if calibration is None:
-        raise ValueError(f"{format_motor_id(motor_id)} AK70 calibration is required")
-    entry = _ak70_calibration_entry(calibration, motor_id)
+    entry = _entry_for_motor(motor_id, calibration, ak45_calibration)
     raw_zero_pos_rad = float(entry["raw_zero_pos_rad"])
     direction_sign = float(entry.get("direction_sign", 1.0))
     raw_target_rad = raw_zero_pos_rad + direction_sign * joint_rad
@@ -215,13 +265,17 @@ def joint_deg_to_raw_rad(motor_id: int, target_deg: float, calibration: dict[str
     return raw_target_rad
 
 
-def raw_rad_to_joint_deg(motor_id: int, raw_pos_rad: float, calibration: dict[str, Any] | None) -> float:
+def raw_rad_to_joint_deg(
+    motor_id: int,
+    raw_pos_rad: float,
+    calibration: dict[str, Any] | None,
+    ak45_calibration: dict[str, Any] | None = None,
+) -> float:
     motor_id = normalize_motor_id(motor_id)
-    if is_ak45(motor_id):
+    try:
+        entry = _entry_for_motor(motor_id, calibration, ak45_calibration)
+    except ValueError:
         return math.degrees(raw_pos_rad)
-    if calibration is None:
-        return math.degrees(raw_pos_rad)
-    entry = _ak70_calibration_entry(calibration, motor_id)
     raw_zero_pos_rad = float(entry["raw_zero_pos_rad"])
     direction_sign = float(entry.get("direction_sign", 1.0))
     return math.degrees(direction_sign * (raw_pos_rad - raw_zero_pos_rad))
@@ -233,7 +287,7 @@ class RealtimeCore:
     rate_hz: float = DEFAULT_RATE_HZ
     default_max_velocity_deg_s: float = DEFAULT_MAX_VELOCITY_DEG_S
     control_mode: ControlMode = ControlMode.DEFAULT
-    calibration_path: str | Path = "motor_calibration.yaml"
+    calibration_path: str | Path = DEFAULT_CALIBRATION_PATH
     mode: ControllerMode = ControllerMode.DISARMED
     target_generation: int = 0
     latest_targets: dict[int, RealtimeTarget] = field(default_factory=dict)
@@ -255,11 +309,49 @@ class RealtimeCore:
             get_motor_profile(motor_id)
         self.motors = {motor_id: MotorRuntime(motor_id) for motor_id in self.motor_ids}
         self.calibration: dict[str, Any] | None = None
-        if any(not is_ak45(motor_id) for motor_id in self.motor_ids):
-            try:
-                self.calibration = load_motor_calibration(str(self.calibration_path))
-            except Exception:
-                self.calibration = None
+        self.ak45_calibration: dict[str, Any] | None = None
+        self.reload_calibrations()
+
+    def reload_calibrations(self) -> None:
+        self.calibration = load_motor_calibration(str(self.calibration_path))
+        try:
+            self.ak45_calibration = load_ak45_calibration()
+        except Exception:
+            # Keep startup compatible with legacy files; per-motor conversion
+            # still requires a valid entry before a non-zero joint target.
+            self.ak45_calibration = {"motors": {}}
+
+    def calibration_entry(self, motor_id: int | str) -> dict[str, Any]:
+        return _entry_for_motor(normalize_motor_id(motor_id), self.calibration, self.ak45_calibration)
+
+    def gains_for_motor(self, motor_id: int | str) -> tuple[float, float]:
+        motor_id = normalize_motor_id(motor_id)
+        profile = get_motor_profile(motor_id)
+        try:
+            entry = self.calibration_entry(motor_id)
+        except ValueError:
+            entry = {}
+        return float(entry.get("kp", profile.default_kp)), float(entry.get("kd", profile.default_kd))
+
+    def direction_sign_for_motor(self, motor_id: int | str) -> int:
+        try:
+            value = int(self.calibration_entry(motor_id).get("direction_sign", 1))
+        except (ValueError, TypeError):
+            value = 1
+        return value if value in (-1, 1) else 1
+
+    def joint_limits_for_motor(self, motor_id: int | str) -> tuple[float, float]:
+        motor_id = normalize_motor_id(motor_id)
+        fallback = get_motor_profile(motor_id).bench_target_limit_deg
+        try:
+            entry = self.calibration_entry(motor_id)
+        except ValueError:
+            entry = {}
+        low = float(entry.get("joint_min_deg", entry.get("min_deg", -fallback)))
+        high = float(entry.get("joint_max_deg", entry.get("max_deg", fallback)))
+        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+            return -fallback, fallback
+        return low, high
 
     @property
     def max_step_rad(self) -> float:
@@ -287,6 +379,8 @@ class RealtimeCore:
         return self.session_info(current)
 
     def disarm(self) -> None:
+        for motor_id in self.latest_targets:
+            self.motors[motor_id].torque_ff_nm = 0.0
         self.latest_targets.clear()
         self.plans.clear()
         self.mode = ControllerMode.DISARMED
@@ -342,28 +436,43 @@ class RealtimeCore:
             "status": self.status(current),
         }
 
+    def refresh_session_activity(
+        self,
+        session_token: str,
+        session_epoch: int | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Keep a validated session alive while a synchronous startup step runs."""
+
+        session = self._require_session(session_token, session_epoch)
+        session.last_heartbeat_monotonic = _now(now)
+
     def validate_target(self, target: RealtimeTarget) -> None:
         motor_id = normalize_motor_id(target.motor_id)
         if motor_id not in self.motors:
             raise ValueError(f"untargeted controller motor {format_motor_id(motor_id)}")
         profile = get_motor_profile(motor_id)
-        if is_ak45(motor_id) and self.motors[motor_id].homing.state != HomingState.HOMED:
-            raise RuntimeError(f"{format_motor_id(motor_id)} AK45 is not HOMED")
         if not math.isfinite(target.position_rad) or not profile.p_min <= target.position_rad <= profile.p_max:
             raise ValueError("target position outside profile range")
         if not math.isfinite(target.kp) or not profile.kp_min <= target.kp <= profile.kp_max:
             raise ValueError("Kp outside profile range")
         if not math.isfinite(target.kd) or not profile.kd_min <= target.kd <= profile.kd_max:
             raise ValueError("Kd outside profile range")
+        target_deg = target.target_deg
+        if target_deg is None:
+            target_deg = raw_rad_to_joint_deg(
+                motor_id, target.position_rad, self.calibration, self.ak45_calibration
+            )
+        low, high = self.joint_limits_for_motor(motor_id)
+        if not low <= target_deg <= high:
+            raise ValueError(f"target_deg outside {low:g}..{high:g}")
         if not is_ak45(motor_id):
-            target_deg = target.target_deg
-            if target_deg is None:
-                target_deg = raw_rad_to_joint_deg(motor_id, target.position_rad, self.calibration)
+            validate_ak70_torque_ff_nm(target.torque_ff_nm)
             if not -AK70_TARGET_LIMIT_DEG <= target_deg <= AK70_TARGET_LIMIT_DEG:
                 raise ValueError("AK70 target_deg outside -120..+120")
-            if not 0.0 < target.kp <= AK70_KP_MAX:
+            if not AK70_KP_MIN < target.kp <= AK70_KP_MAX:
                 raise ValueError("AK70 GUI Kp outside range")
-            if not 0.0 <= target.kd <= AK70_KD_MAX:
+            if not AK70_KD_MIN <= target.kd <= AK70_KD_MAX:
                 raise ValueError("AK70 GUI Kd outside range")
 
     def has_fresh_feedback(self, motor_id: int | str, now: float | None = None) -> bool:
@@ -418,7 +527,7 @@ class RealtimeCore:
                 if target.generation is not None and target.generation < self.motors[motor_id].generation:
                     raise RuntimeError(f"{format_motor_id(motor_id)} stale generation")
             self.validate_target(target)
-            if self.control_mode == ControlMode.AK70_GUI_PERSISTENT_LEASE and not is_ak45(motor_id):
+            if self.control_mode == ControlMode.AK70_GUI_PERSISTENT_LEASE:
                 start_positions[motor_id] = self._select_start_position(motor_id, target.session_token, current)
             else:
                 start_positions[motor_id] = self.motors[motor_id].command_position_rad
@@ -441,12 +550,14 @@ class RealtimeCore:
                 session_token=target.session_token,
                 session_epoch=target.session_epoch,
                 plan_id=target.plan_id,
+                torque_ff_nm=target.torque_ff_nm,
             )
             runtime.control_group_id = target.control_group_id
             runtime.plan_id = target.plan_id
             runtime.target_deg = target.target_deg
             runtime.kp = target.kp
             runtime.kd = target.kd
+            runtime.torque_ff_nm = target.torque_ff_nm
             runtime.owner_session_token = target.session_token
             runtime.state = MotorState.HOME_MOVING if target.display_mode == "home" else MotorState.MOVING
             runtime.enabled = True
@@ -485,6 +596,7 @@ class RealtimeCore:
         session_token: str | None,
         session_epoch: int | None,
         display_mode: str = "target",
+        torque_ff_nm: float = 0.0,
         now: float | None = None,
     ) -> None:
         current = _now(now)
@@ -495,12 +607,14 @@ class RealtimeCore:
             raise ValueError("trajectory requires at least one waypoint")
         if self.control_mode == ControlMode.AK70_GUI_PERSISTENT_LEASE:
             self._require_session(session_token, session_epoch)
+        if not is_ak45(motor_id):
+            torque_ff_nm = validate_ak70_torque_ff_nm(torque_ff_nm)
         raw_waypoints: list[TrajectoryWaypoint] = []
         for waypoint in waypoints:
             duration = float(waypoint.duration)
             if not math.isfinite(duration) or duration <= 0.0:
                 raise ValueError("waypoint duration_sec must be positive")
-            raw_target = joint_deg_to_raw_rad(motor_id, float(waypoint.target_deg), self.calibration)
+            raw_target = joint_deg_to_raw_rad(motor_id, float(waypoint.target_deg), self.calibration, self.ak45_calibration)
             target = RealtimeTarget(
                 motor_id=motor_id,
                 position_rad=raw_target,
@@ -513,6 +627,7 @@ class RealtimeCore:
                 session_token=session_token,
                 session_epoch=session_epoch,
                 plan_id=plan_id,
+                torque_ff_nm=torque_ff_nm,
             )
             self.validate_target(target)
             raw_waypoints.append(TrajectoryWaypoint(float(waypoint.target_deg), duration, raw_target))
@@ -524,6 +639,7 @@ class RealtimeCore:
         runtime.target_deg = raw_waypoints[-1].target_deg
         runtime.kp = kp
         runtime.kd = kd
+        runtime.torque_ff_nm = torque_ff_nm
         runtime.owner_session_token = session_token
         runtime.state = MotorState.HOME_MOVING if display_mode == "home" else MotorState.MOVING
         runtime.enabled = True
@@ -547,6 +663,7 @@ class RealtimeCore:
             session_token=session_token,
             session_epoch=session_epoch,
             plan_id=plan_id,
+            torque_ff_nm=torque_ff_nm,
         )
         self._invalidate_plans_for_ids([motor_id])
         assert raw_waypoints[0].target_position_rad is not None
@@ -557,6 +674,7 @@ class RealtimeCore:
             waypoints={motor_id: raw_waypoints},
             kp={motor_id: kp},
             kd={motor_id: kd},
+            torque_ff_nm={motor_id: torque_ff_nm},
             max_following_error_deg={motor_id: max_following_error_deg},
             current_waypoint_index=0,
             segment_start_position_rad={motor_id: start},
@@ -571,6 +689,97 @@ class RealtimeCore:
         )
         self.target_generation += 1
         self.last_target_time = current
+
+    def set_torque_ff(self, updates: dict[int | str, float], session_token: str | None) -> dict[str, float]:
+        if self.control_mode == ControlMode.AK70_GUI_PERSISTENT_LEASE:
+            session = self._require_session(session_token)
+        else:
+            session = None
+        if not updates:
+            raise ValueError("SET_TORQUE_FF requires updates")
+
+        normalized: dict[int, float] = {}
+        for raw_motor_id, raw_value in updates.items():
+            motor_id = normalize_motor_id(raw_motor_id)
+            motor_text = format_motor_id(motor_id)
+            if motor_id in normalized:
+                raise ValueError(f"duplicate torque FF update {motor_text}")
+            if motor_id not in self.motors or is_ak45(motor_id):
+                raise ValueError("SET_TORQUE_FF is AK70-only and must target controller-managed IDs")
+            runtime = self.motors[motor_id]
+            if motor_id not in self.latest_targets or runtime.owner_session_token != (session.token if session else session_token):
+                raise RuntimeError(f"{motor_text} is not owned by current session")
+            normalized[motor_id] = validate_ak70_torque_ff_nm(raw_value)
+
+        for motor_id, value in normalized.items():
+            runtime = self.motors[motor_id]
+            runtime.torque_ff_nm = value
+            target = self.latest_targets[motor_id]
+            self.latest_targets[motor_id] = RealtimeTarget(
+                motor_id=target.motor_id,
+                position_rad=target.position_rad,
+                kp=target.kp,
+                kd=target.kd,
+                target_deg=target.target_deg,
+                move_sec=target.move_sec,
+                max_following_error_deg=target.max_following_error_deg,
+                control_group_id=target.control_group_id,
+                generation=target.generation,
+                display_mode=target.display_mode,
+                session_token=target.session_token,
+                session_epoch=target.session_epoch,
+                plan_id=target.plan_id,
+                torque_ff_nm=value,
+            )
+            for plan in self.plans.values():
+                if motor_id in plan.torque_ff_nm:
+                    plan.torque_ff_nm[motor_id] = value
+        return {format_motor_id(motor_id): value for motor_id, value in sorted(normalized.items())}
+
+    def set_gains(
+        self,
+        updates: dict[int | str, dict[str, float]],
+        session_token: str | None,
+    ) -> dict[str, dict[str, float]]:
+        if self.control_mode == ControlMode.AK70_GUI_PERSISTENT_LEASE:
+            session = self._require_session(session_token)
+        else:
+            session = None
+        if not updates:
+            raise ValueError("SET_GAINS requires updates")
+
+        candidates: dict[int, RealtimeTarget] = {}
+        for raw_motor_id, raw_gains in updates.items():
+            motor_id = normalize_motor_id(raw_motor_id)
+            motor_text = format_motor_id(motor_id)
+            if motor_id in candidates:
+                raise ValueError(f"duplicate gain update {motor_text}")
+            if motor_id not in self.motors or not isinstance(raw_gains, dict):
+                raise ValueError(f"invalid gain update for {motor_text}")
+            runtime = self.motors[motor_id]
+            expected_token = session.token if session else session_token
+            if motor_id not in self.latest_targets or runtime.owner_session_token != expected_token:
+                raise RuntimeError(f"{motor_text} is not owned by current session")
+            target = self.latest_targets[motor_id]
+            kp = float(raw_gains.get("kp", target.kp))
+            kd = float(raw_gains.get("kd", target.kd))
+            candidate = replace(target, kp=kp, kd=kd)
+            self.validate_target(candidate)
+            candidates[motor_id] = candidate
+
+        for motor_id, candidate in candidates.items():
+            runtime = self.motors[motor_id]
+            runtime.kp = candidate.kp
+            runtime.kd = candidate.kd
+            self.latest_targets[motor_id] = candidate
+            for plan in self.plans.values():
+                if motor_id in plan.kp:
+                    plan.kp[motor_id] = candidate.kp
+                    plan.kd[motor_id] = candidate.kd
+        return {
+            format_motor_id(motor_id): {"kp": target.kp, "kd": target.kd}
+            for motor_id, target in sorted(candidates.items())
+        }
 
     def release_ids(
         self,
@@ -589,8 +798,8 @@ class RealtimeCore:
             try:
                 motor_id = normalize_motor_id(raw)
                 motor_text = format_motor_id(motor_id)
-                if motor_id not in self.motors or is_ak45(motor_id):
-                    raise ValueError("RELEASE_IDS is AK70-only and must target controller-managed IDs")
+                if motor_id not in self.motors:
+                    raise ValueError("RELEASE_IDS must target controller-managed IDs")
                 runtime = self.motors[motor_id]
                 expected = None if expected_generations is None else expected_generations.get(motor_text)
                 if expected is not None and expected != runtime.generation:
@@ -605,6 +814,7 @@ class RealtimeCore:
                 runtime.plan_id = None
                 runtime.target_deg = None
                 runtime.owner_session_token = None
+                runtime.torque_ff_nm = 0.0
                 runtime.command_initialized = False
                 runtime.start_position_rad = None
                 runtime.target_position_rad = None
@@ -624,7 +834,7 @@ class RealtimeCore:
 
     def release_session(self, session_token: str, reason: ReleaseReason = ReleaseReason.RELEASE_SESSION) -> dict[str, Any]:
         session = self._require_session(session_token)
-        owned = [motor_id for motor_id, rt in self.motors.items() if rt.owner_session_token == session.token and not is_ak45(motor_id)]
+        owned = [motor_id for motor_id, rt in self.motors.items() if rt.owner_session_token == session.token]
         result = self.release_ids(owned, session_token=session.token, reason=reason)
         self.plans.clear()
         session.active = False
@@ -634,23 +844,23 @@ class RealtimeCore:
 
     def estop(self) -> dict[str, Any]:
         self.global_epoch += 1
-        active = [motor_id for motor_id in self.latest_targets if not is_ak45(motor_id)]
+        active = list(self.latest_targets)
         self.latest_targets.clear()
         self.plans.clear()
         self.mode = ControllerMode.ESTOPPED
         self.requires_rearm = True
         for runtime in self.motors.values():
-            if not is_ak45(runtime.motor_id):
-                runtime.generation += 1
-                runtime.enabled = False
-                runtime.state = MotorState.ESTOPPED
+            runtime.generation += 1
+            runtime.enabled = False
+            runtime.state = MotorState.ESTOPPED
+            runtime.torque_ff_nm = 0.0
         if self.session is not None:
             self.session.active = False
         self.release_events.append((ReleaseReason.ESTOP, active))
         return {"released_ids": [format_motor_id(m) for m in active], "global_epoch": self.global_epoch}
 
     def shutdown(self) -> dict[str, Any]:
-        active = [motor_id for motor_id in self.latest_targets if not is_ak45(motor_id)]
+        active = list(self.latest_targets)
         self.global_epoch += 1
         self.latest_targets.clear()
         self.plans.clear()
@@ -658,12 +868,14 @@ class RealtimeCore:
         if self.session is not None:
             self.session.active = False
             self.session = None
+        for motor_id in active:
+            self.motors[motor_id].torque_ff_nm = 0.0
         self.release_events.append((ReleaseReason.SHUTDOWN, active))
         return {"released_ids": [format_motor_id(m) for m in active], "global_epoch": self.global_epoch}
 
     def apply_group_fault(self, control_group_id: str, fault: str, scope: FaultScope = FaultScope.GROUP) -> list[int]:
         if scope == FaultScope.GLOBAL:
-            affected = [motor_id for motor_id in self.latest_targets if not is_ak45(motor_id)]
+            affected = list(self.latest_targets)
             self.latest_targets.clear()
             self.plans.clear()
             self.mode = ControllerMode.FAULT
@@ -673,7 +885,7 @@ class RealtimeCore:
             affected = [
                 motor_id
                 for motor_id, target in self.latest_targets.items()
-                if target.control_group_id == control_group_id and not is_ak45(motor_id)
+                if target.control_group_id == control_group_id
             ]
             for motor_id in affected:
                 self.latest_targets.pop(motor_id, None)
@@ -688,6 +900,8 @@ class RealtimeCore:
             runtime.fault = fault
             runtime.command_initialized = False
             runtime.owner_session_token = None
+            runtime.torque_ff_nm = 0.0
+            runtime.torque_ff_nm = 0.0
         self.release_events.append((reason, affected))
         return affected
 
@@ -706,7 +920,7 @@ class RealtimeCore:
             runtime.following_error_deg = math.degrees(abs(runtime.command_position_rad - raw_position_rad))
 
     def on_bus_off_or_reconnect(self) -> None:
-        active = [motor_id for motor_id in self.latest_targets if not is_ak45(motor_id)]
+        active = list(self.latest_targets)
         self.latest_targets.clear()
         self.plans.clear()
         self.mode = ControllerMode.FAULT
@@ -714,8 +928,8 @@ class RealtimeCore:
         self.requires_rearm = True
         for runtime in self.motors.values():
             runtime.homing.on_bus_off()
-            if not is_ak45(runtime.motor_id):
-                runtime.state = MotorState.COMM_ERROR
+            runtime.state = MotorState.COMM_ERROR
+            runtime.torque_ff_nm = 0.0
         self.release_events.append((ReleaseReason.CAN_FAULT, active))
 
     def on_controller_restart(self) -> None:
@@ -733,7 +947,7 @@ class RealtimeCore:
         last = self.session.last_heartbeat_monotonic
         if last is not None and now - last <= GUI_LEASE_TIMEOUT_SEC:
             return
-        active = [motor_id for motor_id in self.latest_targets if not is_ak45(motor_id)]
+        active = list(self.latest_targets)
         self.latest_targets.clear()
         self.plans.clear()
         self.mode = ControllerMode.DISARMED
@@ -745,13 +959,12 @@ class RealtimeCore:
             runtime.generation += 1
             runtime.enabled = False
             runtime.state = MotorState.LEASE_LOST
+            runtime.torque_ff_nm = 0.0
         self.release_events.append((ReleaseReason.LEASE_LOSS, active))
 
     def _check_active_feedback_and_following_error(self, now: float) -> None:
         checked_groups: set[str] = set()
         for motor_id, target in list(self.latest_targets.items()):
-            if is_ak45(motor_id):
-                continue
             runtime = self.motors[motor_id]
             group = target.control_group_id or runtime.control_group_id or f"single-{format_motor_id(motor_id)}"
             if group in checked_groups and group in self.faulted_groups:
@@ -810,6 +1023,7 @@ class RealtimeCore:
             session_token=target.session_token,
             session_epoch=target.session_epoch,
             plan_id=target.plan_id,
+            torque_ff_nm=runtime.torque_ff_nm,
         )
 
     def _command_for_plan(self, plan: TrajectoryPlan, now: float) -> dict[int, RealtimeTarget]:
@@ -840,6 +1054,7 @@ class RealtimeCore:
             session_token=plan.session_token,
             session_epoch=plan.session_epoch,
             plan_id=plan.plan_id,
+            torque_ff_nm=runtime.torque_ff_nm,
         )
         if u >= 1.0:
             next_index = plan.current_waypoint_index + 1
@@ -902,15 +1117,33 @@ class RealtimeCore:
     def session_info(self, now: float | None = None) -> dict[str, Any]:
         current = _now(now)
         if self.session is None:
-            return {"session_token": None, "session_epoch": None, "heartbeat_seq": None, "heartbeat_age": None, "lease_ok": False}
+            return {
+                "active_session": False,
+                "session_token": None,
+                "session_epoch": None,
+                "session_owner": None,
+                "heartbeat_seq": None,
+                "heartbeat_age": None,
+                "lease_ok": False,
+                "lease_remaining_sec": 0.0,
+            }
         last = self.session.last_heartbeat_monotonic
         heartbeat_age = None if last is None else current - last
+        active = bool(self.session.active)
+        lease_remaining = (
+            0.0
+            if heartbeat_age is None or not active
+            else max(0.0, GUI_LEASE_TIMEOUT_SEC - heartbeat_age)
+        )
         return {
+            "active_session": active,
             "session_token": self.session.token,
             "session_epoch": self.session.epoch,
+            "session_owner": self.session.owner,
             "heartbeat_seq": self.session.last_heartbeat_seq,
             "heartbeat_age": heartbeat_age,
             "lease_ok": heartbeat_age is not None and heartbeat_age <= GUI_LEASE_TIMEOUT_SEC and self.session.active,
+            "lease_remaining_sec": lease_remaining,
         }
 
     def status(self, now: float | None = None) -> dict[str, Any]:
@@ -928,19 +1161,32 @@ class RealtimeCore:
             "session": session,
             "session_token": session["session_token"],
             "session_epoch": session["session_epoch"],
+            "session_owner": session["session_owner"],
+            "active_session": session["active_session"],
             "heartbeat_seq": session["heartbeat_seq"],
             "heartbeat_age": session["heartbeat_age"],
             "lease_ok": session["lease_ok"],
+            "lease_remaining_sec": session["lease_remaining_sec"],
             "active_owned_ids": [format_motor_id(m) for m in sorted(self.latest_targets)],
+            "owned_motor_ids": [format_motor_id(m) for m in sorted(self.latest_targets)],
+            "active_target_ids": [format_motor_id(m) for m in sorted(self.latest_targets)],
             "motors": {
                 format_motor_id(motor_id): {
                     "model": get_motor_profile(motor_id).model,
                     "homing": runtime.homing.state.value,
                     "command_position_rad": runtime.command_position_rad,
-                    "commanded_deg": raw_rad_to_joint_deg(motor_id, runtime.command_position_rad, self.calibration),
+                    "commanded_deg": raw_rad_to_joint_deg(
+                        motor_id, runtime.command_position_rad, self.calibration, self.ak45_calibration
+                    ),
                     "actual_deg": None
                     if runtime.feedback_position_rad is None
-                    else raw_rad_to_joint_deg(motor_id, runtime.feedback_position_rad, self.calibration),
+                    else raw_rad_to_joint_deg(
+                        motor_id, runtime.feedback_position_rad, self.calibration, self.ak45_calibration
+                    ),
+                    "raw_position_rad": runtime.feedback_position_rad,
+                    "joint_limit_min_deg": self.joint_limits_for_motor(motor_id)[0],
+                    "joint_limit_max_deg": self.joint_limits_for_motor(motor_id)[1],
+                    "direction_sign": self.direction_sign_for_motor(motor_id),
                     "feedback_age": None if runtime.feedback_monotonic is None else current - runtime.feedback_monotonic,
                     "state": runtime.state.value,
                     "control_group_id": runtime.control_group_id,
@@ -957,6 +1203,7 @@ class RealtimeCore:
                     "move_duration_sec": runtime.move_duration_sec,
                     "kp": runtime.kp,
                     "kd": runtime.kd,
+                    "torque_ff_nm": runtime.torque_ff_nm,
                     "fault": runtime.fault,
                     "owned": motor_id in self.latest_targets,
                 }
@@ -980,16 +1227,21 @@ def targets_from_ipc(message: dict[str, Any], core: RealtimeCore | None = None) 
         else:
             target_deg = float(item.get("target_deg", item["position_deg"]))
             if core is not None:
-                position_rad = joint_deg_to_raw_rad(motor_id, target_deg, core.calibration)
+                position_rad = joint_deg_to_raw_rad(
+                    motor_id, target_deg, core.calibration, core.ak45_calibration
+                )
             else:
                 position_rad = math.radians(target_deg)
         profile = get_motor_profile(motor_id)
+        default_kp, default_kd = (
+            core.gains_for_motor(motor_id) if core is not None else (profile.default_kp, profile.default_kd)
+        )
         targets.append(
             RealtimeTarget(
                 motor_id=motor_id,
                 position_rad=position_rad,
-                kp=float(item.get("kp", profile.default_kp)),
-                kd=float(item.get("kd", profile.default_kd)),
+                kp=float(item.get("kp", default_kp)),
+                kd=float(item.get("kd", default_kd)),
                 target_deg=target_deg,
                 move_sec=None if item.get("move_sec") is None else float(item["move_sec"]),
                 max_following_error_deg=float(item.get("max_following_error_deg", 60.0)),
@@ -999,6 +1251,7 @@ def targets_from_ipc(message: dict[str, Any], core: RealtimeCore | None = None) 
                 session_token=str(item.get("session_token", session_token)) if item.get("session_token", session_token) else None,
                 session_epoch=None if item.get("session_epoch", session_epoch) is None else int(item.get("session_epoch", session_epoch)),
                 plan_id=None if item.get("plan_id") is None else str(item["plan_id"]),
+                torque_ff_nm=float(item.get("torque_ff_nm", 0.0)),
             )
         )
     return targets

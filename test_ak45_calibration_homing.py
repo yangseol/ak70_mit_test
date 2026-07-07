@@ -18,10 +18,10 @@ def test_ak45_calibration_load_save_atomic(tmp_path):
     path = tmp_path / "ak45.yaml"
     data = default_calibration()
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    save_software_zero("0x00B", 1.25, path=path)
+    save_software_zero("0x006", 1.25, path=path)
     loaded = load_ak45_calibration(path)
-    assert loaded["motors"]["0x00B"]["raw_zero_pos_rad"] == pytest.approx(1.25)
-    assert loaded["motors"]["0x00B"]["captured_at"]
+    assert loaded["motors"]["0x006"]["raw_zero_pos_rad"] == pytest.approx(1.25)
+    assert loaded["motors"]["0x006"]["captured_at"]
     assert any(tmp_path.glob("ak45_*.yaml.bak"))
 
 
@@ -34,24 +34,24 @@ def test_direction_sign_transformations():
 
 def test_calibration_missing_blocks_home():
     calibration = default_calibration()
-    machine = HomingMachine(0x00B)
+    machine = HomingMachine(0x006)
     assert machine.state == HomingState.UNHOMED
     assert machine.confirm_horizontal_pose(0.0, calibration) == HomingState.HOMING_REQUIRED
 
 
 def test_user_confirmation_transitions_to_homed_for_session_only():
     calibration = default_calibration()
-    calibration["motors"]["0x00B"]["raw_zero_pos_rad"] = 1.0
-    machine = HomingMachine(0x00B)
+    calibration["motors"]["0x00C"]["raw_zero_pos_rad"] = 1.0
+    machine = HomingMachine(0x00C)
     assert machine.confirm_horizontal_pose(1.0, calibration) == HomingState.HOMED
-    restarted = HomingMachine(0x00B)
+    restarted = HomingMachine(0x00C)
     assert restarted.state == HomingState.UNHOMED
 
 
 def test_bus_off_and_calibration_change_clear_homing():
     calibration = default_calibration()
-    calibration["motors"]["0x00B"]["raw_zero_pos_rad"] = 1.0
-    machine = HomingMachine(0x00B)
+    calibration["motors"]["0x006"]["raw_zero_pos_rad"] = 1.0
+    machine = HomingMachine(0x006)
     machine.confirm_horizontal_pose(1.0, calibration)
     assert machine.on_bus_off() == HomingState.FAULT
     machine.confirm_horizontal_pose(1.0, calibration)
@@ -60,7 +60,6 @@ def test_bus_off_and_calibration_change_clear_homing():
 
 def test_sensor_window_does_not_auto_home():
     assert sensor_window_does_not_home() is True
-    summary = encoder_ambiguity_summary(0x00B)
+    summary = encoder_ambiguity_summary(0x006)
     assert summary["encoder_output_period_deg"] == pytest.approx(10.0)
     assert summary["encoder_output_half_period_deg"] == pytest.approx(5.0)
-

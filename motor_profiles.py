@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 from mit_packet import AK70_10_LIMIT
 
+AK70_KP_MIN = 0.0
+AK70_KP_MAX = 100.0
+AK70_KD_MIN = 0.0
+AK70_KD_MAX = 2.0
+
 
 @dataclass(frozen=True)
 class MotorProfile:
@@ -49,7 +54,7 @@ class MotorProfile:
 AK70_10_PROFILE = MotorProfile(
     model="AK70-10",
     id_min=0x001,
-    id_max=0x00A,
+    id_max=0x00C,
     p_min=AK70_10_LIMIT.p_min,
     p_max=AK70_10_LIMIT.p_max,
     v_min=AK70_10_LIMIT.v_min,
@@ -74,8 +79,8 @@ AK70_10_PROFILE = MotorProfile(
 
 AK45_36_KV80_PROFILE = MotorProfile(
     model="AK45-36-KV80",
-    id_min=0x00B,
-    id_max=0x00D,
+    id_min=0x006,
+    id_max=0x00C,
     p_min=-12.5,
     p_max=12.5,
     v_min=-6.0,
@@ -121,10 +126,12 @@ def format_motor_id(motor_id: int | str) -> str:
 
 def get_motor_profile(motor_id: int | str) -> MotorProfile:
     value = normalize_motor_id(motor_id)
-    if AK70_10_PROFILE.id_min <= value <= AK70_10_PROFILE.id_max:
-        return AK70_10_PROFILE
-    if AK45_36_KV80_PROFILE.id_min <= value <= AK45_36_KV80_PROFILE.id_max:
+    # The lower-body wiring is fixed: only ankle-roll IDs 6 and 12 are AK45.
+    # A range check is not sufficient because the two models share the same bus.
+    if value in (0x006, 0x00C):
         return AK45_36_KV80_PROFILE
+    if 0x001 <= value <= 0x00C:
+        return AK70_10_PROFILE
     raise ValueError(f"unsupported motor ID: {format_motor_id(value)}")
 
 
@@ -138,4 +145,3 @@ def encoder_output_half_period_deg(profile: MotorProfile) -> float:
 
 def is_ak45(motor_id: int | str) -> bool:
     return get_motor_profile(motor_id).model == AK45_36_KV80_PROFILE.model
-

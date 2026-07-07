@@ -1,11 +1,14 @@
 import inspect
 import json
 import math
+import time
 
 import pytest
 
 import ak70_control_center_gui as gui
 from ak_realtime_core import (
+    AK70_KP_MAX,
+    AK70_KP_MIN,
     FEEDBACK_TIMEOUT_SEC,
     FOLLOWING_ERROR_CONSECUTIVE_LIMIT,
     FOLLOWING_ERROR_GRACE_SEC,
@@ -22,6 +25,7 @@ from ak_realtime_core import (
     quintic_smoothstep,
     targets_from_ipc,
 )
+from homing_state import HomingState
 from realtime_ipc import validate_message
 from run_realtime_controller import RealtimeController
 
@@ -60,6 +64,13 @@ def feed(core, motor_id, raw_position, now=10.0):
 def feed_many(core, values, now=10.0):
     for motor_id, raw_position in values.items():
         feed(core, motor_id, raw_position, now)
+
+
+def gui_app_stub():
+    app = object.__new__(gui.ControlCenterApp)
+    app.ready_ids = {1, 6, 12}
+    app.model_gains = {"AK70": {"kp": 8.0, "kd": 0.4}, "AK45": {"kp": 8.0, "kd": 0.4}}
+    return app
 
 
 def test_persistent_mode_keeps_target_after_default_stop_timeout(tmp_path):
@@ -248,6 +259,239 @@ def test_trajectory_visits_each_waypoint_and_holds_last(tmp_path):
     assert core.compute_cycle_commands(now=14.0)[0x001].position_rad == pytest.approx(wp2)
 
 
+def test_torque_ff_defaults_and_commands_follow_target(tmp_path):
+    core, session = arm_persistent_core(tmp_path)
+    assert RealtimeTarget(0x001, 0.1, 8.0, 0.4).torque_ff_nm == pytest.approx(0.0)
+    feed(core, 0x001, 1.0, now=10.0)
+    core.set_latest_targets(
+        [
+            RealtimeTarget(
+                0x001,
+                joint_deg_to_raw_rad(0x001, 5.0, core.calibration),
+                8.0,
+                0.4,
+                target_deg=5.0,
+                session_token="session-a",
+                session_epoch=session["session_epoch"],
+                torque_ff_nm=1.0,
+            )
+        ],
+        now=10.0,
+    )
+    command = core.compute_cycle_commands(now=10.0)[0x001]
+    assert command.torque_ff_nm == pytest.approx(1.0)
+    assert core.status(now=10.0)["motors"]["0x001"]["torque_ff_nm"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("value", [-25.0, 25.0])
+def test_torque_ff_boundaries_allowed(tmp_path, value):
+    core, session = arm_persistent_core(tmp_path)
+    feed(core, 0x001, 1.0, now=10.0)
+    core.set_latest_targets(
+        [
+            RealtimeTarget(
+                0x001,
+                1.1,
+                8.0,
+                0.4,
+                target_deg=5.0,
+                session_token="session-a",
+                session_epoch=session["session_epoch"],
+                torque_ff_nm=value,
+            )
+        ],
+        now=10.0,
+    )
+    assert core.compute_cycle_commands(now=10.0)[0x001].torque_ff_nm == pytest.approx(value)
+
+
+@pytest.mark.parametrize("value", [-25.1, 25.1, math.nan, math.inf, -math.inf])
+def test_torque_ff_invalid_values_rejected(tmp_path, value):
+    core, session = arm_persistent_core(tmp_path)
+    feed(core, 0x001, 1.0, now=10.0)
+    with pytest.raises(ValueError):
+        core.set_latest_targets(
+            [
+                RealtimeTarget(
+                    0x001,
+                    1.1,
+                    8.0,
+                    0.4,
+                    target_deg=5.0,
+                    session_token="session-a",
+                    session_epoch=session["session_epoch"],
+                    torque_ff_nm=value,
+                )
+            ],
+            now=10.0,
+        )
+
+
+def test_set_torque_ff_moving_preserves_motion_identity(tmp_path):
+    core, session = arm_persistent_core(tmp_path)
+    feed(core, 0x001, 1.0, now=10.0)
+    core.set_latest_targets(
+        [
+            RealtimeTarget(
+                0x001,
+                1.5,
+                8.0,
+                0.4,
+                target_deg=5.0,
+                move_sec=2.0,
+                control_group_id="g",
+                plan_id="p",
+                session_token="session-a",
+                session_epoch=session["session_epoch"],
+            )
+        ],
+        now=10.0,
+    )
+    runtime = core.motors[0x001]
+    before = (
+        runtime.target_position_rad,
+        runtime.start_position_rad,
+        runtime.trajectory_start_monotonic,
+        runtime.move_duration_sec,
+        runtime.plan_id,
+        runtime.control_group_id,
+        runtime.generation,
+    )
+    updated = core.set_torque_ff({"0x001": 3.0}, session_token="session-a")
+    after = (
+        runtime.target_position_rad,
+        runtime.start_position_rad,
+        runtime.trajectory_start_monotonic,
+        runtime.move_duration_sec,
+        runtime.plan_id,
+        runtime.control_group_id,
+        runtime.generation,
+    )
+    assert updated == {"0x001": 3.0}
+    assert after == before
+    assert core.compute_cycle_commands(now=10.5)[0x001].torque_ff_nm == pytest.approx(3.0)
+
+
+def test_set_torque_ff_trajectory_preserves_plan_progress(tmp_path):
+    core, session = arm_persistent_core(tmp_path)
+    feed(core, 0x001, 1.0, now=10.0)
+    core.set_trajectory(
+        motor_id=0x001,
+        waypoints=[TrajectoryWaypoint(10.0, 1.0), TrajectoryWaypoint(20.0, 1.0)],
+        kp=8.0,
+        kd=0.4,
+        max_following_error_deg=60.0,
+        control_group_id="traj",
+        plan_id="plan-a",
+        session_token="session-a",
+        session_epoch=session["session_epoch"],
+        now=10.0,
+    )
+    plan = core.plans["plan-a"]
+    before = (
+        plan.current_waypoint_index,
+        plan.segment_start_monotonic,
+        plan.segment_duration_sec,
+        dict(plan.segment_start_position_rad),
+        dict(plan.segment_target_position_rad),
+        dict(plan.generation),
+        core.motors[0x001].trajectory_start_monotonic,
+        core.motors[0x001].generation,
+    )
+    core.set_torque_ff({"0x001": -2.0}, session_token="session-a")
+    after = (
+        plan.current_waypoint_index,
+        plan.segment_start_monotonic,
+        plan.segment_duration_sec,
+        dict(plan.segment_start_position_rad),
+        dict(plan.segment_target_position_rad),
+        dict(plan.generation),
+        core.motors[0x001].trajectory_start_monotonic,
+        core.motors[0x001].generation,
+    )
+    assert after == before
+    assert core.compute_cycle_commands(now=10.25)[0x001].torque_ff_nm == pytest.approx(-2.0)
+    assert "plan-a" in core.plans
+
+
+def test_set_torque_ff_atomic_rejects_bad_batch(tmp_path):
+    core, session = arm_persistent_core(tmp_path)
+    feed_many(core, {0x001: 1.0, 0x002: 1.5}, now=10.0)
+    core.set_latest_targets(
+        [
+            RealtimeTarget(0x001, 1.1, 8.0, 0.4, target_deg=5.0, session_token="session-a", session_epoch=session["session_epoch"], torque_ff_nm=1.0),
+            RealtimeTarget(0x002, 1.6, 8.0, 0.4, target_deg=5.0, session_token="session-a", session_epoch=session["session_epoch"], torque_ff_nm=2.0),
+        ],
+        now=10.0,
+    )
+    with pytest.raises(ValueError):
+        core.set_torque_ff({"0x001": 3.0, "0x002": 26.0}, session_token="session-a")
+    assert core.latest_targets[0x001].torque_ff_nm == pytest.approx(1.0)
+    assert core.latest_targets[0x002].torque_ff_nm == pytest.approx(2.0)
+
+
+def test_controller_set_torque_ff_ack_and_session_ownership(tmp_path):
+    controller = RealtimeController("can0", [0x001], 50.0, True, ControlMode.AK70_GUI_PERSISTENT_LEASE, write_calibration(tmp_path))
+    session = controller.core.arm(owner="test", session_token="session-a", now=10.0)
+    feed(controller.core, 0x001, 1.0, now=10.0)
+    controller.core.set_latest_targets(
+        [
+            RealtimeTarget(
+                0x001,
+                1.1,
+                8.0,
+                0.4,
+                target_deg=5.0,
+                session_token="session-a",
+                session_epoch=session["session_epoch"],
+            )
+        ],
+        now=10.0,
+    )
+    response = controller.handle_message({"command": "SET_TORQUE_FF", "session_token": "session-a", "updates": {"0x001": 4.0}})
+    assert response["ok"] is True
+    assert response["updated"] == {"0x001": 4.0}
+    assert controller.core.latest_targets[0x001].torque_ff_nm == pytest.approx(4.0)
+    with pytest.raises(RuntimeError):
+        controller.handle_message({"command": "SET_TORQUE_FF", "session_token": "other", "updates": {"0x001": 5.0}})
+
+
+def test_controller_mit_command_uses_latest_torque_ff(tmp_path, monkeypatch):
+    controller = RealtimeController("can0", [0x001], 50.0, True, ControlMode.AK70_GUI_PERSISTENT_LEASE, write_calibration(tmp_path))
+    now = time.monotonic()
+    session = controller.core.arm(owner="test", session_token="session-a", now=now)
+    feed(controller.core, 0x001, 1.0, now=now)
+    controller.core.set_latest_targets(
+        [
+            RealtimeTarget(
+                0x001,
+                1.1,
+                8.0,
+                0.4,
+                target_deg=5.0,
+                session_token="session-a",
+                session_epoch=session["session_epoch"],
+                torque_ff_nm=-1.0,
+            )
+        ],
+        now=now,
+    )
+    captured = []
+
+    def fake_pack_checked_commands(commands):
+        captured.extend(commands)
+        return {0x001: b"\x00" * 8}
+
+    class FakeBus:
+        def send(self, _message):
+            return None
+
+    monkeypatch.setattr("run_realtime_controller.pack_checked_commands", fake_pack_checked_commands)
+    controller.bus = FakeBus()
+    controller.control_cycle()
+    assert captured[-1].torque == pytest.approx(-1.0)
+
+
 def test_release_invalidates_plan_and_prevents_reactivation(tmp_path):
     core, session = arm_persistent_core(tmp_path)
     feed(core, 0x001, 1.0, now=10.0)
@@ -413,6 +657,199 @@ def test_ak70_target_limits_allow_boundaries_and_reject_outside(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("kp", "allowed"),
+    [
+        (0.0, False),
+        (-1.0, False),
+        (10.0, True),
+        (30.0, True),
+        (50.0, True),
+        (80.0, True),
+        (100.0, True),
+        (100.1, False),
+        (101.0, False),
+    ],
+)
+def test_ak70_realtime_kp_limit_matrix(tmp_path, kp, allowed):
+    core, session = arm_persistent_core(tmp_path)
+    feed(core, 0x001, 1.0, now=10.0)
+    target = RealtimeTarget(
+        0x001,
+        joint_deg_to_raw_rad(0x001, 10.0, core.calibration),
+        kp,
+        0.4,
+        target_deg=10.0,
+        session_token="session-a",
+        session_epoch=session["session_epoch"],
+    )
+    if allowed:
+        core.set_latest_targets([target], now=10.0)
+        assert core.latest_targets[0x001].kp == pytest.approx(kp)
+    else:
+        with pytest.raises(ValueError):
+            core.set_latest_targets([target], now=10.0)
+
+
+def test_ak70_single_home_trajectory_and_batch_allow_kp_100(tmp_path):
+    core, session = arm_persistent_core(tmp_path)
+    feed_many(core, {0x001: 1.0, 0x002: 1.5}, now=10.0)
+    single = RealtimeTarget(
+        0x001,
+        joint_deg_to_raw_rad(0x001, 10.0, core.calibration),
+        AK70_KP_MAX,
+        0.4,
+        target_deg=10.0,
+        session_token="session-a",
+        session_epoch=session["session_epoch"],
+    )
+    core.set_latest_targets([single], now=10.0)
+    assert core.latest_targets[0x001].kp == pytest.approx(AK70_KP_MAX)
+
+    home = RealtimeTarget(
+        0x001,
+        joint_deg_to_raw_rad(0x001, 0.0, core.calibration),
+        AK70_KP_MAX,
+        0.4,
+        target_deg=0.0,
+        display_mode="home",
+        session_token="session-a",
+        session_epoch=session["session_epoch"],
+    )
+    core.set_latest_targets([home], now=10.1)
+    assert core.latest_targets[0x001].display_mode == "home"
+    assert core.latest_targets[0x001].kp == pytest.approx(AK70_KP_MAX)
+
+    core.set_trajectory(
+        motor_id=0x001,
+        waypoints=[TrajectoryWaypoint(5.0, 1.0), TrajectoryWaypoint(0.0, 1.0)],
+        kp=AK70_KP_MAX,
+        kd=0.4,
+        max_following_error_deg=60.0,
+        control_group_id="traj",
+        plan_id="kp100-traj",
+        session_token="session-a",
+        session_epoch=session["session_epoch"],
+        now=10.2,
+    )
+    assert core.plans["kp100-traj"].kp[0x001] == pytest.approx(AK70_KP_MAX)
+
+    batch = [
+        RealtimeTarget(
+            0x001,
+            joint_deg_to_raw_rad(0x001, 3.0, core.calibration),
+            AK70_KP_MAX,
+            0.4,
+            target_deg=3.0,
+            control_group_id="batch",
+            session_token="session-a",
+            session_epoch=session["session_epoch"],
+        ),
+        RealtimeTarget(
+            0x002,
+            joint_deg_to_raw_rad(0x002, -3.0, core.calibration),
+            AK70_KP_MAX,
+            0.4,
+            target_deg=-3.0,
+            control_group_id="batch",
+            session_token="session-a",
+            session_epoch=session["session_epoch"],
+        ),
+    ]
+    core.set_latest_targets(batch, now=10.3)
+    assert {target.kp for target in core.latest_targets.values()} == {AK70_KP_MAX}
+
+
+def test_ipc_ak70_kp_100_allowed_and_over_limit_rejected():
+    base = {
+        "command": "SET_TARGETS",
+        "targets": [{"motor_id": "0x001", "position_deg": 1.0, "kp": AK70_KP_MAX, "kd": 0.4}],
+    }
+    validate_message(json.dumps(base).encode())
+    for bad_kp in (AK70_KP_MIN, -1.0, AK70_KP_MAX + 0.1, 101.0):
+        message = {
+            "command": "SET_TARGETS",
+            "targets": [{"motor_id": "0x001", "position_deg": 1.0, "kp": bad_kp, "kd": 0.4}],
+        }
+        with pytest.raises(ValueError):
+            validate_message(json.dumps(message).encode())
+    validate_message(
+        json.dumps(
+            {
+                "command": "SET_TRAJECTORY",
+                "motor_id": "0x001",
+                "waypoints": [{"target_deg": 1.0, "duration": 0.5}],
+                "kp": AK70_KP_MAX,
+                "kd": 0.4,
+            }
+        ).encode()
+    )
+    with pytest.raises(ValueError):
+        validate_message(
+            json.dumps(
+                {
+                    "command": "SET_TRAJECTORY",
+                    "motor_id": "0x001",
+                    "waypoints": [{"target_deg": 1.0, "duration": 0.5}],
+                    "kp": 101.0,
+                    "kd": 0.4,
+                }
+            ).encode()
+        )
+
+
+def test_controller_accepts_ak70_kp_100_and_rejects_over_limit(tmp_path):
+    controller = RealtimeController("can0", [0x001], 50.0, True, ControlMode.AK70_GUI_PERSISTENT_LEASE, write_calibration(tmp_path))
+    session = controller.core.arm(owner="test", session_token="session-a", now=10.0)
+    feed(controller.core, 0x001, 1.0, now=10.0)
+    ok = controller.handle_message(
+        {
+            "command": "SET_TARGETS",
+            "session_token": "session-a",
+            "session_epoch": session["session_epoch"],
+            "targets": [{"motor_id": "0x001", "position_deg": 1.0, "kp": AK70_KP_MAX, "kd": 0.4}],
+        }
+    )
+    assert ok["ok"] is True
+    with pytest.raises(ValueError):
+        controller.handle_message(
+            {
+                "command": "SET_TARGETS",
+                "session_token": "session-a",
+                "session_epoch": session["session_epoch"],
+                "targets": [{"motor_id": "0x001", "position_deg": 1.0, "kp": 101.0, "kd": 0.4}],
+            }
+        )
+
+
+def test_gui_gain_limits_match_current_motor_models():
+    assert gui.gain_limits("AK70", "kp") == (0.1, AK70_KP_MAX)
+    assert gui.gain_limits("AK70", "kd") == (0.0, 2.0)
+    assert gui.gain_limits("AK45", "kp") == (0.0, 500.0)
+    assert gui.gain_limits("AK45", "kd") == (0.0, 5.0)
+
+
+def test_gui_stream_items_can_carry_model_gains_without_torque_ff_ui():
+    app = gui_app_stub()
+    items = gui.build_stream_target_items(
+        {1: 5.0, 6: -1.0, 12: 1.0},
+        {motor_id: app._gain_for_motor(motor_id) for motor_id in (1, 6, 12)},
+    )
+
+    by_id = {item["motor_id"]: item for item in items}
+    assert by_id["0x001"]["kp"] == pytest.approx(8.0)
+    assert by_id["0x006"]["kp"] == pytest.approx(8.0)
+    assert "torque_ff_nm" not in by_id["0x001"]
+
+
+def test_ak45_core_profile_kp_validation_regression():
+    core = RealtimeCore([0x006])
+    core.arm()
+    core.motors[0x006].homing.state = HomingState.HOMED
+    core.set_latest_targets([RealtimeTarget(0x006, 0.0, 100.0, 0.4)], now=10.0)
+    assert core.latest_targets[0x006].kp == pytest.approx(100.0)
+
+
 def test_ipc_accepts_new_commands():
     validate_message(
         json.dumps(
@@ -438,52 +875,54 @@ def test_ipc_accepts_new_commands():
             }
         ).encode()
     )
-
-
-def test_gui_ak70_actual_paths_do_not_spawn_legacy_finite_scripts():
-    forbidden = ["script_path(\"move_once\")", "script_path(\"hold\")", "script_path(\"trajectory\")", "script_path(\"multi_pose\")"]
-    single_sources = "\n".join(
-        inspect.getsource(method)
-        for method in (
-            gui.SingleMotorPage.run_move_once,
-            gui.SingleMotorPage.run_hold,
-            gui.SingleMotorPage.run_trajectory,
-            gui.SingleMotorPage.run_home_to_zero,
-        )
+    validate_message(
+        json.dumps(
+            {
+                "command": "SET_TORQUE_FF",
+                "request_id": "r4",
+                "session_token": "s",
+                "updates": {"0x001": 1.0, "0x003": -1.0},
+            }
+        ).encode()
     )
-    for text in forbidden:
-        assert text not in single_sources
-    multi_pose_source = inspect.getsource(gui.MultiMotorPage.run_pose)
-    assert "submit_ak70_targets" in multi_pose_source
-    assert "if not contains_ak45" in multi_pose_source
 
 
-def test_gui_active_read_detect_blocks_legacy_queries():
-    assert "active_realtime_ids" in inspect.getsource(gui.AK70ControlCenterApp.run_read_positions)
-    assert "active_realtime_ids" in inspect.getsource(gui.CommunicationPage.detect_all)
-    assert "active_realtime_ids" in inspect.getsource(gui.CommunicationPage.detect_selected)
+@pytest.mark.parametrize("value", [-25.1, 25.1, math.nan, math.inf, -math.inf])
+def test_ipc_rejects_invalid_torque_ff(value):
+    with pytest.raises(ValueError):
+        validate_message(
+            json.dumps(
+                {
+                    "command": "SET_TORQUE_FF",
+                    "request_id": "r",
+                    "session_token": "s",
+                    "updates": {"0x001": value},
+                },
+                allow_nan=True,
+            ).encode()
+        )
+    with pytest.raises(ValueError):
+        validate_message(
+            json.dumps(
+                {
+                    "command": "SET_TARGETS",
+                    "targets": [{"motor_id": "0x001", "position_deg": 1.0, "kp": 8.0, "kd": 0.4, "torque_ff_nm": value}],
+                },
+                allow_nan=True,
+            ).encode()
+        )
 
 
-def test_direct_fallback_requires_controller_lock_before_can_bus():
-    source = inspect.getsource(gui.AK70ControlCenterApp.direct_zero_torque_fallback)
-    assert source.index("acquire_controller_lock") < source.index("can.Bus")
+def test_gui_current_control_center_does_not_spawn_legacy_finite_scripts():
+    source = inspect.getsource(gui.ControlCenterApp)
+    for text in ("script_path(\"move_once\")", "script_path(\"hold\")", "script_path(\"trajectory\")", "script_path(\"multi_pose\")"):
+        assert text not in source
 
 
-def test_close_state_machine_waits_for_status_and_ack_before_destroy():
-    on_close = inspect.getsource(gui.AK70ControlCenterApp.on_close)
-    release_ack = inspect.getsource(gui.AK70ControlCenterApp._on_close_release_ack)
-    finish = inspect.getsource(gui.AK70ControlCenterApp._finish_close)
-    assert "CLOSE_STATUS_PENDING" in on_close
-    assert "callback=self._on_close_status" in on_close
+def test_close_path_releases_or_shutdowns_before_destroy():
+    on_close = inspect.getsource(gui.ControlCenterApp.on_close)
+    finish = inspect.getsource(gui.ControlCenterApp.finish_close)
+    assert "SHUTDOWN" in on_close
+    assert "RELEASE_SESSION" in on_close
     assert "root.destroy" not in on_close
-    assert "_finish_close" in release_ack
     assert "root.destroy" in finish
-    assert gui.close_command_for_ownership(True, True) == "SHUTDOWN"
-    assert gui.close_command_for_ownership(False, True) == "RELEASE_SESSION"
-    assert gui.close_command_for_ownership(False, False) is None
-
-
-def test_single_motor_combobox_filters_ak70_ids_only():
-    source = inspect.getsource(gui.SingleMotorPage.on_show)
-    assert "if motor_id in AK70_IDS" in source
-    assert "or AK70_IDS" in source
