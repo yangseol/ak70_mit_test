@@ -10,3 +10,8 @@ __pycache__/
 .ak_realtime_client_*.sock
 .ak_realtime_probe_*.sock
 all_motor_can_check.log
+
+# Local backup files
+backups/
+*.bak
+*.bak.*
